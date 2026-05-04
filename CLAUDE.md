@@ -2,46 +2,61 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository state
-
-This repo is **pre-scaffold**: at time of writing, the only tracked file is `README.md`. The README describes the intended product and stack but no code, `package.json`, or framework files exist yet. Treat the README as the design spec and bootstrap accordingly when asked to start implementation — do not assume Next.js conventions are already wired up.
-
 ## Product
 
-Employer-facing web app for issuing verifiable employment credentials. Employers authenticate, fill in employee details (company, role, dates), and issue a signed employment credential. The credential is delivered to the employee as an SD-JWT VC for later presentation to recruitment platforms.
+Employer-facing web app for issuing verifiable employment credentials. Employers sign in, submit employee details, and a credential record is created with `status = 'pending'`. The signing + email-delivery side is **deliberately not built yet** — keep the issue flow database-only until the SD-JWT signing SDK and Resend integration are added.
 
-Credential signing is expected to be **mocked** until the signing SDK is ready — keep the signing call behind a single seam so it can be swapped without touching the issue flow.
+## Stack
 
-## Planned stack
+- Next.js 15 (App Router) + React 19 + TypeScript
+- Tailwind CSS v4 (CSS-first config; no `tailwind.config.*` file — see `src/app/globals.css`)
+- SQLite via `better-sqlite3` (synchronous; `data.db` in repo root, gitignored)
+- `jose` for JWT (edge-compatible — required for middleware)
+- `bcryptjs` for password hashing (pure JS; swap to native `bcrypt` if a perf/security need appears — API is identical)
 
-- Next.js (App Router) + TypeScript
-- SQLite via `better-sqlite3` (synchronous; no connection pool needed)
-- Tailwind CSS
-- Resend for transactional email (delivers the credential to the employee)
+## Commands
 
-## Planned routes
+```bash
+npm install
+cp .env.example .env       # then set JWT_SECRET to a long random string
+npm run dev                # http://localhost:3000
+npm run build && npm run start
+npm run lint
+```
 
-- `/login` — employer auth
-- `/dashboard` — list of issued credentials
-- `/issue` — form to create + send a new credential
-- `/settings` — employer profile (company name, domain)
+There is no test runner configured yet.
 
-## Planned data model
+## Architecture
 
-Two SQLite tables:
+**Server Components + Server Actions only.** No `app/api/*` routes. Forms post directly to server actions colocated in `actions.ts` next to the page that uses them. Validation in actions; errors surfaced via `?error=...` query params, mapped to messages at the page level.
 
-- `employers`: `id, email, password_hash, company_name, company_domain, created_at`
-- `credentials`: `id, employer_id, employee_email, company, role, start_date, end_date, status, created_at`
+**Auth boundary is enforced in two places**:
+1. `src/middleware.ts` — edge runtime, JWT-verifies the `session` cookie via `jose`. Redirects unauthed → `/login` for protected routes; redirects authed users away from `/login` and `/register`. Cannot import `db.ts` (edge runtime — no native modules).
+2. `src/lib/auth.ts` — `requireEmployer()` is the in-page gate. It re-checks the session AND looks up the employer row, redirecting to `/login` if either fails. Wrapped in React's `cache()` so layout + page in the same request share one DB lookup. **Always call this in protected pages/actions** rather than reading `getSession()` directly — it gives you the typed employer record.
 
-`credentials.status` is the lifecycle field — issuance flow should write it (e.g. `pending` → `sent` → `delivered`/`failed`) rather than inferring state from email send results at read time.
+The `(authed)` route group exists so the nav + auth check live in one shared layout. Add new authed routes inside it.
+
+**Sessions**: signed JWT in an `httpOnly` cookie named `session`, 7-day expiry, HS256 with `JWT_SECRET`. Created via `createSession({ employerId })` in `src/lib/session.ts`. No server-side session store.
+
+**Database**: `src/lib/db.ts` opens the SQLite file at module load and runs `CREATE TABLE IF NOT EXISTS` for both tables. WAL mode + foreign keys on. The default export is the live `Database` instance — import and call `.prepare(...).run/get/all` directly. Don't introduce an ORM or query builder for this MVP. `better-sqlite3` is in `serverExternalPackages` (`next.config.mjs`) so Next doesn't try to bundle the native module.
+
+**Schema** (see `src/lib/db.ts` for the source of truth):
+- `employers(id, email UNIQUE, password_hash, company_name, company_domain, created_at)`
+- `credentials(id, employer_id FK, employee_email, company, role, start_date, end_date NULL, status, created_at)`
+
+`credentials.status` is the issuance lifecycle field. Today only `'pending'` is written. When signing/email lands, transition `pending → sent → delivered/failed` by writing `status` from the worker, not by inferring from external state at read time.
+
+**Registration**: `/register` was added so the app is usable end-to-end. The original spec only listed `/login`; if Triangle ID later moves to invite-only employer onboarding, this page is the thing to remove or gate.
+
+## Conventions
+
+- Form fields use the `<Field>` component in `src/components/Field.tsx`. Reach for it before hand-rolling inputs.
+- Server actions: trim + lowercase emails/domains before they touch the DB. Validate at the boundary (the action), not in the page.
+- Use `redirect()` from `next/navigation` for both success and error paths in actions — never wrap action bodies in `try/catch` around it (it throws a sentinel that Next intercepts).
+- `cookies()`, `headers()`, `params`, and `searchParams` are **async** in Next 15 — always `await` them.
 
 ## Environment
 
-- `RESEND_API_KEY` — Resend API key for credential email delivery
-- `JWT_SECRET` — secret for signing session tokens (auth uses JWT sessions, not a session store)
-
-`.env.example` should be kept in sync whenever a new env var is introduced.
-
-## Commands (once scaffolded)
-
-The README documents the standard Next.js workflow: `npm install`, `npm run dev` (serves at `http://localhost:3000`). Build/lint/test commands do not yet exist — add them to this file once `package.json` is created.
+- `JWT_SECRET` — required. Session signing key. App throws on first request if unset.
+- `RESEND_API_KEY` — placeholder for when email delivery is wired up; not consumed yet.
+- `DATABASE_PATH` — optional override for the SQLite file location.
